@@ -130,10 +130,8 @@ namespace consoleSAMOIG
             DateTime myDate= DateTime.Now;
             string localFilePath = $@"{filePath}\Download.zip";  //Path.Combine failed me
 
-            //First get the SAM API key from ApiKey table
+            //First get the SAM API key from configuration
             var context = new SAMOIGdat();
-            var mylookedupRecord = GetSQLapiData("SAM");
-
             bool found = false;  //forces first loop iteration
             int intBackDay = 0;  //Number of days to backup to find latest SAM file
             while (!found)
@@ -156,7 +154,7 @@ namespace consoleSAMOIG
                 try
                 {
                     string myJul = Globals.GetJulianDate(myDate);  //returns Julian Date (2 digit year + day of year) e.g. 25123
-                    string fileUrl = string.Format($@"https://api.sam.gov/data-services/v1/extracts?api_key={GetSQLapiData("SAM")}&fileName=SAM_Exclusions_Public_Extract_V2_{myJul}.ZIP");
+                    string fileUrl = string.Format($@"https://api.sam.gov/data-services/v1/extracts?api_key={Globals.conSamApiKey}&fileName=SAM_Exclusions_Public_Extract_V2_{myJul}.ZIP");
 
                     Console.WriteLine($"Attempting to download SAM file for date: {myDate:yyyy-MM-dd} (Julian: {myJul})");
 
