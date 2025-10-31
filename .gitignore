@@ -75,9 +75,6 @@ appsettings.Development.json
 appsettings.*.json
 !appsettings.json
 
-# Sensitive data files
-Globals.cs
-
 # Others
 *.Cache
 ClientBin/
@@ -168,6 +165,3 @@ Desktop.ini
 
 # Mac desktop service store files
 .DS_Store
-
-# Sensitive files
-Mail.cs
