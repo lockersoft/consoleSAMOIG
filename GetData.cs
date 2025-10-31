@@ -128,7 +128,7 @@ namespace consoleSAMOIG
             //
             DateOnly myDateOnly = DateOnly.FromDateTime(DateTime.Now);
             DateTime myDate= DateTime.Now;
-            string localFilePath = $@"{filePath}\Download.zip";  //Path.Combine failed me
+            string localFilePath = Path.Combine(filePath, "Download.zip");
 
             //First get the SAM API key from configuration
             var context = new SAMOIGdat();
@@ -154,63 +154,97 @@ namespace consoleSAMOIG
                 try
                 {
                     string myJul = Globals.GetJulianDate(myDate);  //returns Julian Date (2 digit year + day of year) e.g. 25123
-                    string fileUrl = string.Format($@"https://api.sam.gov/data-services/v1/extracts?api_key={Globals.conSamApiKey}&fileName=SAM_Exclusions_Public_Extract_V2_{myJul}.ZIP");
 
-                    Console.WriteLine($"Attempting to download SAM file for date: {myDate:yyyy-MM-dd} (Julian: {myJul})");
-
-                    using (var downloadStream = await _httpClient.GetStreamAsync(fileUrl))
-                    using (var fileStream = new FileStream(localFilePath, FileMode.Create, FileAccess.Write))
+                    // Check if file already exists (for testing/debugging)
+                    if (File.Exists(localFilePath))
                     {
-                        await downloadStream.CopyToAsync(fileStream);
                         found = true;
-                        Console.WriteLine("SAM file downloaded successfully");
+                        Console.WriteLine($"Using existing SAM file for date: {myDate:yyyy-MM-dd} (Julian: {myJul})");
+                    }
+                    else
+                    {
+                        string fileUrl = string.Format($@"https://api.sam.gov/data-services/v1/extracts?api_key={Globals.conSamApiKey}&fileName=SAM_Exclusions_Public_Extract_V2_{myJul}.ZIP");
+                        Console.WriteLine($"Attempting to download SAM file for date: {myDate:yyyy-MM-dd} (Julian: {myJul})");
+
+                        using (var downloadStream = await _httpClient.GetStreamAsync(fileUrl))
+                        using (var fileStream = new FileStream(localFilePath, FileMode.Create, FileAccess.Write))
+                        {
+                            await downloadStream.CopyToAsync(fileStream);
+                            found = true;
+                            Console.WriteLine("SAM file downloaded successfully");
+                        }
                     }
 
                     // Process the file if download was successful
                     if (found)
                     {
+                        var totalTimer = System.Diagnostics.Stopwatch.StartNew();
+
                         //All good - unzip file
+                        var unzipTimer = System.Diagnostics.Stopwatch.StartNew();
                         var GoodSAM = UnZipSAMtoList(myJul, filePath);
+                        unzipTimer.Stop();
+                        Console.WriteLine($"Unzip and parse CSV: {unzipTimer.ElapsedMilliseconds}ms ({GoodSAM.Count} SAM records)");
 
-                        //Join GoodSAM with Contacts on First, Last  <--May need to add city that was pulled by Ashley
-                        //Result is in matchedContacts and is a list of Contacts failing SAM - These are failures
-                        var matchedContacts = (from person in GoodSAM
-                                               join contact in context.Contacts
-                                               on new
-                                               {
-                                                   NameFirst = person.First?.Trim().ToUpper(),
-                                                   NameLast = person.Last?.Trim().ToUpper()
-                                               }
-                                               equals new
-                                               {
-                                                   NameFirst = contact.NameFirst?.Trim().ToUpper(),
-                                                   NameLast = contact.NameLast?.Trim().ToUpper()
-                                               }
-                                               where (contact.TypeContactIdfk == 27 || contact.TypeContactIdfk == 36)
-                                                     && contact.RegistrationStatus == "Approved"
-                                                     && contact.Archived == null
-                                                     && contact.Ssn != null
-                                                     && contact.Ssn.Length == 11
-                                                     && contact.Ssn.Substring(0, 3) != "000"
-                                                     && contact.Ssn.Substring(0, 3) != "666"
-                                               select contact).ToList();
+                        //Pre-filter and normalize SAM data in memory to reduce database load
+                        var samLookup = GoodSAM
+                            .GroupBy(p => new { First = p.First?.Trim().ToUpper(), Last = p.Last?.Trim().ToUpper() })
+                            .Select(g => g.Key)
+                            .Where(k => !string.IsNullOrEmpty(k.First) && !string.IsNullOrEmpty(k.Last))
+                            .ToHashSet();
+                        Console.WriteLine($"SAM unique names: {samLookup.Count}");
 
-                        //Foreach failure update ExclusionHits from 'Pass' to 'Fail'
-                        foreach (var contact in matchedContacts)
-                        {
-                            var hitsToUpdate = context.ExclusionHits
-                            .Where(e => e.ContactIdfk == contact.ContactIdpk)
+                        //Fetch eligible contacts from database with optimized query
+                        var dbQueryTimer = System.Diagnostics.Stopwatch.StartNew();
+                        var eligibleContacts = context.Contacts
+                            .Where(c => (c.TypeContactIdfk == 27 || c.TypeContactIdfk == 36)
+                                     && c.RegistrationStatus == "Approved"
+                                     && c.Archived == null
+                                     && c.Ssn != null
+                                     && c.Ssn.Length == 11)
+                            .Select(c => new { c.ContactIdpk, c.NameFirst, c.NameLast, c.Ssn })
+                            .ToList()
+                            .Where(c => c.Ssn != null && c.Ssn.Substring(0, 3) != "000" && c.Ssn.Substring(0, 3) != "666")
+                            .ToList();
+                        dbQueryTimer.Stop();
+                        Console.WriteLine($"Database query for eligible contacts: {dbQueryTimer.ElapsedMilliseconds}ms ({eligibleContacts.Count} contacts)");
+
+                        //Join in memory - much faster than database join
+                        var joinTimer = System.Diagnostics.Stopwatch.StartNew();
+                        var matchedContactIds = eligibleContacts
+                            .Where(c => samLookup.Contains(new { First = c.NameFirst?.Trim().ToUpper(), Last = c.NameLast?.Trim().ToUpper() }))
+                            .Select(c => c.ContactIdpk)
+                            .ToList();
+                        joinTimer.Stop();
+                        Console.WriteLine($"In-memory join: {joinTimer.ElapsedMilliseconds}ms ({matchedContactIds.Count} matches)");
+
+                        //Batch update ExclusionHits - fetch all SAM hits for today, filter in memory
+                        var updateTimer = System.Diagnostics.Stopwatch.StartNew();
+                        var matchedContactIdSet = new HashSet<int>(matchedContactIds);
+                        var hitsToUpdate = context.ExclusionHits
+                            .Where(e => e.DateRun == myDateOnly && e.TableHit == "SAM")
+                            .ToList()
+                            .Where(e => matchedContactIdSet.Contains(e.ContactIdfk))
                             .ToList();
 
-                            foreach (var hit in hitsToUpdate.Where(h => h.DateRun == myDateOnly && h.TableHit == "SAM"))
-                            {
-                                hit.NameHit = "SAM";
-                                hit.TableHit = "SAM";
-                                hit.LikelyMatch = "Fail";
-                            }
+                        foreach (var hit in hitsToUpdate)
+                        {
+                            hit.NameHit = "SAM";
+                            hit.TableHit = "SAM";
+                            hit.LikelyMatch = "Fail";
                         }
+                        updateTimer.Stop();
+                        Console.WriteLine($"Update exclusion hits: {updateTimer.ElapsedMilliseconds}ms ({hitsToUpdate.Count} records)");
+
                         // Save changes to the database
+                        var saveTimer = System.Diagnostics.Stopwatch.StartNew();
                         context.SaveChanges();
+                        saveTimer.Stop();
+                        Console.WriteLine($"Save changes: {saveTimer.ElapsedMilliseconds}ms");
+
+                        totalTimer.Stop();
+                        Console.WriteLine($"TOTAL PROCESSING TIME: {totalTimer.ElapsedMilliseconds}ms ({totalTimer.Elapsed.TotalSeconds:F2} seconds)");
+
                         await SendEmail(Globals.conReportToEmail, "Success SAM", "SAM Exclusion Records Created", "<strong>SAM Exclusion Records Created</strong>");
                     }
                 }
@@ -231,9 +265,9 @@ namespace consoleSAMOIG
         public static List<Person> UnZipSAMtoList(string JulDate, string localFileName)
         {
             //Unzip the CSV file to temp path
-            ZipFile.ExtractToDirectory($@"{localFileName}\Download.zip", filePath, true);
+            ZipFile.ExtractToDirectory(Path.Combine(localFileName, "Download.zip"), filePath, true);
             //Path to the unzipped CSV file
-            string csvFilePath = $@"{localFileName}\SAM_Exclusions_Public_Extract_V2_{JulDate}.CSV";
+            string csvFilePath = Path.Combine(localFileName, $"SAM_Exclusions_Public_Extract_V2_{JulDate}.CSV");
 
             //Read all rows into the local path into lis GoodOIG.  Exclude those with bad birthdates and empty.
             var GoodSAM = File.ReadAllLines(csvFilePath)
@@ -244,7 +278,7 @@ namespace consoleSAMOIG
                  {
                      First = fields[3].Trim('"'),
                      Last = fields[5].Trim('"'),
-                     BirthDate = DateOnly.Parse(DateTime.Now.Date.ToString())  //<--  ???
+                     BirthDate = DateOnly.FromDateTime(DateTime.Now)
                  })
              .ToList();
             //Return the list of Persons from SAM
