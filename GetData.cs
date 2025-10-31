@@ -109,17 +109,17 @@ namespace consoleSAMOIG
                     }
                     context.SaveChanges();
                 }
-                SendEmail(Globals.conReportToEmail, "Success OIG", "OIG Exclusion Records Created", "<strong>OIG Exclusion Records Created</strong>");
+                await SendEmail(Globals.conReportToEmail, "Success OIG", "OIG Exclusion Records Created", "<strong>OIG Exclusion Records Created</strong>");
             }
 
             catch (HttpRequestException e)
             {
-                SendEmail(Globals.conReportToEmail, $"BuildOIG() HTTP Request Error {e.Message}", $"Error: {e.Message}", $"<strong>Error:{e.Message}</strong>");
+                await SendEmail(Globals.conReportToEmail, $"BuildOIG() HTTP Request Error {e.Message}", $"Error: {e.Message}", $"<strong>Error:{e.Message}</strong>");
             }
 
             catch (Exception ex)
             {
-                SendEmail(Globals.conReportToEmail, "BuildOIG() Error", $"Error: {ex.Message}", $"<strong>Error:{ex.Message}</strong>");
+                await SendEmail(Globals.conReportToEmail, "BuildOIG() Error", $"Error: {ex.Message}", $"<strong>Error:{ex.Message}</strong>");
             }
         }
 
@@ -138,96 +138,94 @@ namespace consoleSAMOIG
             int intBackDay = 0;  //Number of days to backup to find latest SAM file
             while (!found)
             {
-                myDate = DateTime.Now.AddDays(intBackDay);  //Date to backyp (??) to
+                myDate = DateTime.Now.AddDays(intBackDay);  //Date to backup to
                 myDateOnly = DateOnly.FromDateTime(myDate);
+
+                // Check if we've tried too many times
+                if (intBackDay <= -10)
+                {
+                    await SendEmail(
+                        Globals.conReportToEmail,
+                        "BuildSAM() Error",
+                        "Too Many SAM Download attempts - expired bad key",
+                        "<strong>Too Many SAM Download attempts - likely expired key</strong>"
+                    );
+                    break;
+                }
+
                 try
                 {
-                    //var test = DateTime.Parse(myDate);
-                    string myJul = Globals.GetJulianDate(myDate);  //returns Julian Date (2 digit year + day of year) e.g. 25123 
+                    string myJul = Globals.GetJulianDate(myDate);  //returns Julian Date (2 digit year + day of year) e.g. 25123
                     string fileUrl = string.Format($@"https://api.sam.gov/data-services/v1/extracts?api_key={GetSQLapiData("SAM")}&fileName=SAM_Exclusions_Public_Extract_V2_{myJul}.ZIP");
+
+                    Console.WriteLine($"Attempting to download SAM file for date: {myDate:yyyy-MM-dd} (Julian: {myJul})");
+
                     using (var downloadStream = await _httpClient.GetStreamAsync(fileUrl))
                     using (var fileStream = new FileStream(localFilePath, FileMode.Create, FileAccess.Write))
                     {
                         await downloadStream.CopyToAsync(fileStream);
                         found = true;
+                        Console.WriteLine("SAM file downloaded successfully");
                     }
-                    //found = true;    //Remove this line after testing
-                    if (!found)
+
+                    // Process the file if download was successful
+                    if (found)
                     {
-                        --intBackDay;
-                        //Too many attempts throw a Fail Exception
-                        if (intBackDay == 10)
+                        //All good - unzip file
+                        var GoodSAM = UnZipSAMtoList(myJul, filePath);
+
+                        //Join GoodSAM with Contacts on First, Last  <--May need to add city that was pulled by Ashley
+                        //Result is in matchedContacts and is a list of Contacts failing SAM - These are failures
+                        var matchedContacts = (from person in GoodSAM
+                                               join contact in context.Contacts
+                                               on new
+                                               {
+                                                   NameFirst = person.First?.Trim().ToUpper(),
+                                                   NameLast = person.Last?.Trim().ToUpper()
+                                               }
+                                               equals new
+                                               {
+                                                   NameFirst = contact.NameFirst?.Trim().ToUpper(),
+                                                   NameLast = contact.NameLast?.Trim().ToUpper()
+                                               }
+                                               where (contact.TypeContactIdfk == 27 || contact.TypeContactIdfk == 36)
+                                                     && contact.RegistrationStatus == "Approved"
+                                                     && contact.Archived == null
+                                                     && contact.Ssn != null
+                                                     && contact.Ssn.Length == 11
+                                                     && contact.Ssn.Substring(0, 3) != "000"
+                                                     && contact.Ssn.Substring(0, 3) != "666"
+                                               select contact).ToList();
+
+                        //Foreach failure update ExclusionHits from 'Pass' to 'Fail'
+                        foreach (var contact in matchedContacts)
                         {
-                            //Too many attempts throw a Fail Exception
-                            if (intBackDay == 10)
+                            var hitsToUpdate = context.ExclusionHits
+                            .Where(e => e.ContactIdfk == contact.ContactIdpk)
+                            .ToList();
+
+                            foreach (var hit in hitsToUpdate.Where(h => h.DateRun == myDateOnly && h.TableHit == "SAM"))
                             {
-                                SendEmail(
-                                Globals.conReportToEmail,
-                                "BuildSAM() Error",
-                                "Too Many SAM Download attempts - expired bad key",
-                                "<strong>Too Many SAM Download attempts - likely expired key</strong>"
-                                );
-                                break;  //<-- I never liked this
-                            }
-                            else
-                            {
-                                //All good - unzip file
-                                var GoodSAM = UnZipSAMtoList(myJul, filePath);
-
-                                //Join GoodSAM with Contacts on First, Last  <--May need to add city that was pulled by Ashley
-                                //Result is in matchedContacts and is a list of Contacts failing SAM - These are failures
-                                var matchedContacts = (from person in GoodSAM
-                                                       join contact in context.Contacts
-                                                       on new
-                                                       {
-                                                           NameFirst = person.First?.Trim().ToUpper(),
-                                                           NameLast = person.Last?.Trim().ToUpper()
-                                                       }
-                                                       equals new
-                                                       {
-                                                           NameFirst = contact.NameFirst?.Trim().ToUpper(),
-                                                           NameLast = contact.NameLast?.Trim().ToUpper()
-                                                       }
-                                                       where (contact.TypeContactIdfk == 27 || contact.TypeContactIdfk == 36)
-                                                             && contact.RegistrationStatus == "Approved"
-                                                             && contact.Archived == null
-                                                             && contact.Ssn != null
-                                                             && contact.Ssn.Length == 11
-                                                             && contact.Ssn.Substring(0, 3) != "000"
-                                                             && contact.Ssn.Substring(0, 3) != "666"
-                                                       select contact).ToList();
-
-                                //Foreach failure update ExclusionHits from 'Pass' to 'Fail'
-                                foreach (var contact in matchedContacts)
-                                {
-                                    var hitsToUpdate = context.ExclusionHits
-                                    .Where(e => e.ContactIdfk == contact.ContactIdpk)
-                                    .ToList();
-
-                                    foreach (var hit in hitsToUpdate.Where(h => h.DateRun == myDateOnly && h.TableHit == "SAM"))
-                                    {
-                                        hit.NameHit = "SAM";
-                                        hit.TableHit = "SAM";
-                                        hit.LikelyMatch = "Fail";
-                                    }
-                                }
-                                // Save changes to the database
-                                context.SaveChanges();
-                                SendEmail(Globals.conReportToEmail, "Success SAM", "SAM Exclusion Records Created", "<strong>SAM Exclusion Records Created</strong>");
+                                hit.NameHit = "SAM";
+                                hit.TableHit = "SAM";
+                                hit.LikelyMatch = "Fail";
                             }
                         }
+                        // Save changes to the database
+                        context.SaveChanges();
+                        await SendEmail(Globals.conReportToEmail, "Success SAM", "SAM Exclusion Records Created", "<strong>SAM Exclusion Records Created</strong>");
                     }
                 }
-
                 catch (HttpRequestException e)
                 {
-                    SendEmail(Globals.conReportToEmail, $"BuildSAM() HTTP Request Error {e.Message}", $"Error: {e.Message}", $"<strong>Error:{e.Message}</strong>");
+                    Console.WriteLine($"HTTP error downloading SAM file (day offset: {intBackDay}): {e.Message}");
+                    --intBackDay;  // Try previous day
                 }
-
                 catch (Exception e)
                 {
-                    SendEmail(Globals.conReportToEmail, "BuildSAM() Error", $"Error: {e.Message}", $"<strong>Error:{e.Message}</strong>");
-
+                    Console.WriteLine($"Error processing SAM file (day offset: {intBackDay}): {e.Message}");
+                    await SendEmail(Globals.conReportToEmail, "BuildSAM() Error", $"Error: {e.Message}", $"<strong>Error:{e.Message}</strong>");
+                    break;  // Stop on non-HTTP errors
                 }
             }
         }
@@ -264,7 +262,7 @@ namespace consoleSAMOIG
             return mylookedupRecord.ApiKey1;
         }
 
-        internal static void MakeExclusionRecords()
+        internal static async Task MakeExclusionRecords()
         {
             //Add student records to ExclusionHits for SAM - Set all to initial 'Pass'
             using var Newcontext = new SAMOIGdat();
@@ -313,19 +311,36 @@ namespace consoleSAMOIG
 
             NewerContext.ExclusionHits.AddRange(hits);
             NewerContext.SaveChanges();
-            SendEmail(Globals.conReportToEmail, "Success OIG", "OIG Exclusion Records Created", "<strong>OIG Exclusion Records Created</strong>");
+            await SendEmail(Globals.conReportToEmail, "Success OIG", "OIG Exclusion Records Created", "<strong>OIG Exclusion Records Created</strong>");
         }
 
-        internal static void SendEmail(string toEmail, string subject, string plainTextContent, string htmlContent)
+        internal static async Task SendEmail(string toEmail, string subject, string plainTextContent, string htmlContent)
         {
             try
             {
+                Console.WriteLine($"Attempting to send email to {toEmail} with subject '{subject}'");
+                Console.WriteLine($"Using SendGrid API Key: {Globals.conSendGrid.Substring(0, Math.Min(10, Globals.conSendGrid.Length))}...");
+
                 EmailService emailService = new(Globals.conSendGrid);
-                bool success = emailService.SendEmailAsync(toEmail, subject, plainTextContent, htmlContent).Result;
+                bool success = await emailService.SendEmailAsync(toEmail, subject, plainTextContent, htmlContent);
+
+                if (success)
+                {
+                    Console.WriteLine($"SUCCESS: Email sent to {toEmail} with subject '{subject}'");
+                }
+                else
+                {
+                    Console.WriteLine($"WARNING: Email failed to send to {toEmail} with subject '{subject}'");
+                }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                //You are screwed here
+                Console.WriteLine($"ERROR: Failed to send email to {toEmail}. Subject: '{subject}'. Error: {ex.Message}");
+                Console.WriteLine($"Stack Trace: {ex.StackTrace}");
+                if (ex.InnerException != null)
+                {
+                    Console.WriteLine($"Inner Exception: {ex.InnerException.Message}");
+                }
             }
         }
 
