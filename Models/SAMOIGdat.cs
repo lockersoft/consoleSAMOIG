@@ -24,7 +24,8 @@ public partial class SAMOIGdat : DbContext
 
 
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
-        => optionsBuilder.UseSqlServer(Globals.conString);
+        => optionsBuilder.UseSqlServer(Globals.conString, options =>
+            options.CommandTimeout(600)); // Set SQL command timeout to 10 minutes (600 seconds)
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

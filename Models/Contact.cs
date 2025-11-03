@@ -95,7 +95,7 @@ public partial class Contact
 
     public bool NeedsReviewCpnw { get; set; }
 
-    public int NeedsReviewEd { get; set; }
+    public bool NeedsReviewEd { get; set; }
 
-    public int NeedsReviewHc { get; set; }
+    public bool NeedsReviewHc { get; set; }
 }

@@ -17,16 +17,15 @@ try
 }
 catch (Exception ex)
 {
-    Console.WriteLine($"FATAL ERROR: {ex.Message}");
-    Console.WriteLine($"Stack Trace: {ex.StackTrace}");
+    Console.WriteLine($"FATAL ERROR: {ex.ToString()}");
 
     try
     {
         await GetData.SendEmail(
             Globals.conReportToEmail,
             "Program Fatal Error",
-            $"Fatal Error: {ex.Message}\n\nStack Trace:\n{ex.StackTrace}",
-            $"<strong>Fatal Error:</strong> {ex.Message}<br/><br/><strong>Stack Trace:</strong><br/><pre>{ex.StackTrace}</pre>"
+            $"Complete Exception Details:\n{ex.ToString()}",
+            $"<strong>Complete Exception Details:</strong><br/><pre>{System.Net.WebUtility.HtmlEncode(ex.ToString())}</pre>"
         );
     }
     catch

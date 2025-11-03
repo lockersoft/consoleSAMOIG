@@ -11,7 +11,10 @@ namespace consoleSAMOIG
 
         //Saves data to users temp files
         private static readonly System.String filePath = Path.GetTempPath();
-        private static readonly HttpClient _httpClient = new();    
+        private static readonly HttpClient _httpClient = new()
+        {
+            Timeout = TimeSpan.FromMinutes(10) // Set HTTP timeout to 10 minutes
+        };    
 
        public static async Task BuildOIG()
         {
@@ -28,7 +31,10 @@ namespace consoleSAMOIG
             var context = new SAMOIGdat();
 
             //Download the file
-            using HttpClient client = new();
+            using HttpClient client = new()
+            {
+                Timeout = TimeSpan.FromMinutes(10) // Set HTTP timeout to 10 minutes
+            };
             try
             {
                 //Set a user-agent header to avoid 403 Forbidden errors
@@ -68,31 +74,48 @@ namespace consoleSAMOIG
                     .ToList();
 
 
-                //Join GoodOIG with Contacts on First, Last, and BirthDate
-                //Result is in matchedContacts and is a list of Contacts failing OIG
-                var matchedContacts = (from person in GoodOIG
-                                       join contact in context.Contacts
-                                       on new
-                                       {
-                                           NameFirst = person.First?.Trim().ToUpper(),
-                                           NameLast = person.Last?.Trim().ToUpper(),
-                                           BirthDate = person.BirthDate.ToString()
+                //Pre-filter and normalize OIG data in memory to reduce database load
+                var hashSetTimer = System.Diagnostics.Stopwatch.StartNew();
+                var oigLookup = GoodOIG
+                    .GroupBy(p => new {
+                        First = p.First?.Trim().ToUpper(),
+                        Last = p.Last?.Trim().ToUpper(),
+                        BirthDate = p.BirthDate.ToString()
+                    })
+                    .Select(g => g.Key)
+                    .Where(k => !string.IsNullOrEmpty(k.First) && !string.IsNullOrEmpty(k.Last))
+                    .ToHashSet();
+                hashSetTimer.Stop();
+                Console.WriteLine($"OIG create HashSet: {hashSetTimer.ElapsedMilliseconds}ms ({oigLookup.Count} unique persons)");
 
-                                       }
-                                       equals new
-                                       {
-                                           NameFirst = contact.NameFirst?.Trim().ToUpper(),
-                                           NameLast = contact.NameLast?.Trim().ToUpper(),
-                                           BirthDate = contact.Dob.ToString()
-                                       }
-                                       where (contact.TypeContactIdfk == 27 || contact.TypeContactIdfk == 36)
-                                             && contact.RegistrationStatus == "Approved"
-                                             && contact.Archived == null
-                                             && contact.Ssn != null
-                                             && contact.Ssn.Length == 11
-                                             && contact.Ssn.Substring(0, 3) != "000"
-                                             && contact.Ssn.Substring(0, 3) != "666"
-                                       select contact).ToList();
+                //Fetch eligible contacts from database with optimized query
+                var dbQueryTimer = System.Diagnostics.Stopwatch.StartNew();
+                var eligibleContacts = context.Contacts
+                    .Where(c => (c.TypeContactIdfk == 27 || c.TypeContactIdfk == 36)
+                             && c.RegistrationStatus == "Approved"
+                             && c.Archived == null
+                             && c.Ssn != null
+                             && c.Ssn.Length == 11)
+                    .ToList()
+                    .Where(c => c.Ssn.Substring(0, 3) != "000" && c.Ssn.Substring(0, 3) != "666")
+                    .ToList();
+                dbQueryTimer.Stop();
+                Console.WriteLine($"Database query for eligible contacts: {dbQueryTimer.ElapsedMilliseconds}ms ({eligibleContacts.Count} contacts)");
+
+                //Join in memory - much faster than database join
+                var joinTimer = System.Diagnostics.Stopwatch.StartNew();
+                var matchedContacts = eligibleContacts
+                    .Where(c => oigLookup.Contains(new {
+                        First = c.NameFirst?.Trim().ToUpper(),
+                        Last = c.NameLast?.Trim().ToUpper(),
+                        BirthDate = c.Dob.ToString()
+                    }))
+                    .ToList();
+                joinTimer.Stop();
+                Console.WriteLine($"In-memory join: {joinTimer.ElapsedMilliseconds}ms ({matchedContacts.Count} matches)");
+
+                var totalTimer = hashSetTimer.ElapsedMilliseconds + dbQueryTimer.ElapsedMilliseconds + joinTimer.ElapsedMilliseconds;
+                Console.WriteLine($"TOTAL OIG PROCESSING TIME: {totalTimer}ms ({(totalTimer/1000.0):F2} seconds)");
 
                 //Update ExclusionHits for each matched contact
                 foreach (var contact in matchedContacts)
@@ -114,12 +137,28 @@ namespace consoleSAMOIG
 
             catch (HttpRequestException e)
             {
-                await SendEmail(Globals.conReportToEmail, $"BuildOIG() HTTP Request Error {e.Message}", $"Error: {e.Message}", $"<strong>Error:{e.Message}</strong>");
+                string plainText = $"Location: BuildOIG() - HTTP Request downloading OIG file\n";
+                plainText += $"URL: {fileUrl}\n\n";
+                plainText += $"Complete Exception Details:\n{e.ToString()}";
+
+                string htmlContent = $"<strong>Location:</strong> BuildOIG() - HTTP Request downloading OIG file<br/>";
+                htmlContent += $"<strong>URL:</strong> {fileUrl}<br/><br/>";
+                htmlContent += $"<strong>Complete Exception Details:</strong><br/><pre>{System.Net.WebUtility.HtmlEncode(e.ToString())}</pre>";
+
+                await SendEmail(Globals.conReportToEmail, $"BuildOIG() HTTP Request Error", plainText, htmlContent);
             }
 
             catch (Exception ex)
             {
-                await SendEmail(Globals.conReportToEmail, "BuildOIG() Error", $"Error: {ex.Message}", $"<strong>Error:{ex.Message}</strong>");
+                string plainText = $"Location: BuildOIG() - Processing or database operation\n";
+                plainText += $"Local File: {localPath}\n\n";
+                plainText += $"Complete Exception Details:\n{ex.ToString()}";
+
+                string htmlContent = $"<strong>Location:</strong> BuildOIG() - Processing or database operation<br/>";
+                htmlContent += $"<strong>Local File:</strong> {localPath}<br/><br/>";
+                htmlContent += $"<strong>Complete Exception Details:</strong><br/><pre>{System.Net.WebUtility.HtmlEncode(ex.ToString())}</pre>";
+
+                await SendEmail(Globals.conReportToEmail, "BuildOIG() Error", plainText, htmlContent);
             }
         }
 
@@ -142,11 +181,23 @@ namespace consoleSAMOIG
                 // Check if we've tried too many times
                 if (intBackDay <= -10)
                 {
+                    string plainText = $"Location: BuildSAM() - Too many download attempts\n";
+                    plainText += $"Attempted {Math.Abs(intBackDay)} days back from {DateTime.Now:yyyy-MM-dd}\n";
+                    plainText += $"Date Range Tried: {DateTime.Now.AddDays(intBackDay):yyyy-MM-dd} to {DateTime.Now:yyyy-MM-dd}\n";
+                    plainText += $"Error: Could not download SAM file - possibly expired API key or file not available\n";
+                    plainText += $"API Key: {Globals.conSamApiKey.Substring(0, Math.Min(10, Globals.conSamApiKey.Length))}...";
+
+                    string htmlContent = $"<strong>Location:</strong> BuildSAM() - Too many download attempts<br/>";
+                    htmlContent += $"<strong>Attempted:</strong> {Math.Abs(intBackDay)} days back from {DateTime.Now:yyyy-MM-dd}<br/>";
+                    htmlContent += $"<strong>Date Range Tried:</strong> {DateTime.Now.AddDays(intBackDay):yyyy-MM-dd} to {DateTime.Now:yyyy-MM-dd}<br/>";
+                    htmlContent += $"<strong>Error:</strong> Could not download SAM file - possibly expired API key or file not available<br/>";
+                    htmlContent += $"<strong>API Key:</strong> {Globals.conSamApiKey.Substring(0, Math.Min(10, Globals.conSamApiKey.Length))}...";
+
                     await SendEmail(
                         Globals.conReportToEmail,
-                        "BuildSAM() Error",
-                        "Too Many SAM Download attempts - expired bad key",
-                        "<strong>Too Many SAM Download attempts - likely expired key</strong>"
+                        "BuildSAM() Error - Too Many Download Attempts",
+                        plainText,
+                        htmlContent
                     );
                     break;
                 }
@@ -155,24 +206,21 @@ namespace consoleSAMOIG
                 {
                     string myJul = Globals.GetJulianDate(myDate);  //returns Julian Date (2 digit year + day of year) e.g. 25123
 
-                    // Check if file already exists (for testing/debugging)
+                    // Delete old zip file if it exists to ensure fresh download
                     if (File.Exists(localFilePath))
                     {
-                        found = true;
-                        Console.WriteLine($"Using existing SAM file for date: {myDate:yyyy-MM-dd} (Julian: {myJul})");
+                        File.Delete(localFilePath);
                     }
-                    else
-                    {
-                        string fileUrl = string.Format($@"https://api.sam.gov/data-services/v1/extracts?api_key={Globals.conSamApiKey}&fileName=SAM_Exclusions_Public_Extract_V2_{myJul}.ZIP");
-                        Console.WriteLine($"Attempting to download SAM file for date: {myDate:yyyy-MM-dd} (Julian: {myJul})");
 
-                        using (var downloadStream = await _httpClient.GetStreamAsync(fileUrl))
-                        using (var fileStream = new FileStream(localFilePath, FileMode.Create, FileAccess.Write))
-                        {
-                            await downloadStream.CopyToAsync(fileStream);
-                            found = true;
-                            Console.WriteLine("SAM file downloaded successfully");
-                        }
+                    string fileUrl = string.Format($@"https://api.sam.gov/data-services/v1/extracts?api_key={Globals.conSamApiKey}&fileName=SAM_Exclusions_Public_Extract_V2_{myJul}.ZIP");
+                    Console.WriteLine($"Attempting to download SAM file for date: {myDate:yyyy-MM-dd} (Julian: {myJul})");
+
+                    using (var downloadStream = await _httpClient.GetStreamAsync(fileUrl))
+                    using (var fileStream = new FileStream(localFilePath, FileMode.Create, FileAccess.Write))
+                    {
+                        await downloadStream.CopyToAsync(fileStream);
+                        found = true;
+                        Console.WriteLine("SAM file downloaded successfully");
                     }
 
                     // Process the file if download was successful
@@ -256,7 +304,21 @@ namespace consoleSAMOIG
                 catch (Exception e)
                 {
                     Console.WriteLine($"Error processing SAM file (day offset: {intBackDay}): {e.Message}");
-                    await SendEmail(Globals.conReportToEmail, "BuildSAM() Error", $"Error: {e.Message}", $"<strong>Error:{e.Message}</strong>");
+
+                    string myJul = Globals.GetJulianDate(myDate);
+                    string plainText = $"Location: BuildSAM() - Processing or database operation\n";
+                    plainText += $"Day Offset: {intBackDay}\n";
+                    plainText += $"Date Attempted: {myDate:yyyy-MM-dd} (Julian: {myJul})\n";
+                    plainText += $"Local File Path: {localFilePath}\n\n";
+                    plainText += $"Complete Exception Details:\n{e.ToString()}";
+
+                    string htmlContent = $"<strong>Location:</strong> BuildSAM() - Processing or database operation<br/>";
+                    htmlContent += $"<strong>Day Offset:</strong> {intBackDay}<br/>";
+                    htmlContent += $"<strong>Date Attempted:</strong> {myDate:yyyy-MM-dd} (Julian: {myJul})<br/>";
+                    htmlContent += $"<strong>Local File Path:</strong> {localFilePath}<br/><br/>";
+                    htmlContent += $"<strong>Complete Exception Details:</strong><br/><pre>{System.Net.WebUtility.HtmlEncode(e.ToString())}</pre>";
+
+                    await SendEmail(Globals.conReportToEmail, "BuildSAM() Error", plainText, htmlContent);
                     break;  // Stop on non-HTTP errors
                 }
             }

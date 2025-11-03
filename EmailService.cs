@@ -20,12 +20,23 @@ namespace consoleSAMOIG
             var to = new EmailAddress(toEmail);
             var msg = MailHelper.CreateSingleEmail(from, to, subject, plainTextContent, htmlContent);
 
+            Console.WriteLine($"SendGrid - Sending email:");
+            Console.WriteLine($"  From: {from.Email} ({from.Name})");
+            Console.WriteLine($"  To: {to.Email}");
+            Console.WriteLine($"  Subject: {subject}");
+
             var response = await client.SendEmailAsync(msg);
 
-            Console.WriteLine($"SendGrid Response Status: {response.StatusCode}");
-            if (response.StatusCode != System.Net.HttpStatusCode.Accepted)
+            Console.WriteLine($"SendGrid Response Status: {response.StatusCode} ({(int)response.StatusCode})");
+            Console.WriteLine($"SendGrid Response Headers:");
+            foreach (var header in response.Headers)
             {
-                var body = await response.Body.ReadAsStringAsync();
+                Console.WriteLine($"  {header.Key}: {string.Join(", ", header.Value)}");
+            }
+
+            var body = await response.Body.ReadAsStringAsync();
+            if (!string.IsNullOrEmpty(body))
+            {
                 Console.WriteLine($"SendGrid Response Body: {body}");
             }
 

@@ -165,3 +165,6 @@ Desktop.ini
 
 # Mac desktop service store files
 .DS_Store
+
+# Claude Code settings
+.claude/*
